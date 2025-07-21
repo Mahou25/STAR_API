@@ -15,1710 +15,1140 @@ from vedo import Mesh, show, colors as vcolors
 from sklearn.cluster import KMeans
 from werkzeug.utils import secure_filename
 import logging
-from datetime import datetime
-import base64
-logging.basicConfig(level=logging.INFO)
+from functools import lru_cache, wraps
+from typing import Dict, Tuple, Optional, Any, List
+import concurrent.futures
+import threading
+from collections import defaultdict
+from dataclasses import dataclass, asdict
+import gc
+import psutil
+import time
+from contextlib import contextmanager
+
+# Configuration optimisée du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('star_api.log', encoding='utf-8')
+    ]
+)
 logger = logging.getLogger(__name__)
 
-
+# Configuration Flask optimisée
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=['*'], methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
 
-# Configuration
-BASE_DIR = os.path.join(os.path.dirname(__file__), '..', 'star_1_1')
-MAPPING_PATH = os.path.join(BASE_DIR, 'star_measurements_mapping.json')
-TEMP_DIR = tempfile.mkdtemp()
-UPLOAD_FOLDER = 'uploads'
-GENERATED_FOLDER = 'generated_clothes'
-ALLOWED_EXTENSIONS = {'obj'}
-
-# Création des dossiers
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(GENERATED_FOLDER, exist_ok=True)
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['GENERATED_FOLDER'] = GENERATED_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-
-# Cache pour les modèles chargés
-models_cache = {}
-# _____________________________________________________fonctions pour génération de mesh 3D________________________________________________________________
-
-# --- Fonctions utilitaires STAR ---
-def charger_modele_star(npz_path):
-    """Charge un modèle STAR depuis un fichier NPZ"""
-    try:
-        data = np.load(npz_path)
-        v_template = data['v_template']
-        f = data['f']
-        J_regressor = data['J_regressor']
-        shapedirs = data.get('shapedirs', None)
-        posedirs = data.get('posedirs', None)
-        Jtr = J_regressor.dot(v_template)
-        
-        return {
-            'v_template': v_template,
-            'f': f,
-            'Jtr': Jtr,
-            'J_regressor': J_regressor,
-            'shapedirs': shapedirs,
-            'posedirs': posedirs
-        }
-    except Exception as e:
-        raise Exception(f"Erreur lors du chargement du modèle: {str(e)}")
-
-def charger_mapping():
-    """Charge le mapping des mesures"""
-    try:
-        with open(MAPPING_PATH, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        raise Exception(f"Erreur lors du chargement du mapping: {str(e)}")
-
-def calculer_mesures_modele(vertices, joints, mapping):
-    """Calcule les mesures actuelles du modèle"""
-    mesures = {}
-    for mesure, info in mapping.items():
-        joint_indices = info["joints"]
-        if len(joint_indices) == 2:
-            # Distance entre deux joints
-            mesures[mesure] = euclidean(joints[joint_indices[0]], joints[joint_indices[1]])
-        elif len(joint_indices) == 1:
-            # Pour les tours (approximation basée sur les vertices voisins)
-            joint_pos = joints[joint_indices[0]]
-            distances = np.linalg.norm(vertices - joint_pos, axis=1)
-            nearby_vertices = vertices[distances < np.percentile(distances, 20)]
-            if len(nearby_vertices) > 3:
-                center = np.mean(nearby_vertices, axis=0)
-                radii = np.linalg.norm(nearby_vertices - center, axis=1)
-                mesures[mesure] = 2 * np.pi * np.mean(radii)
-            else:
-                mesures[mesure] = 50.0
-    return mesures
-
-def deformer_modele(v_template, shapedirs, mesures_cibles, mesures_actuelles, J_regressor):
-    """Déforme le modèle pour s'approcher des mesures cibles"""
-    if shapedirs is None:
-        return v_template, np.zeros(10)
+# Configuration des constantes
+@dataclass
+class Config:
+    BASE_DIR: str = os.path.join(os.path.dirname(__file__), '..', 'star_1_1')
+    MAPPING_PATH: str = os.path.join(BASE_DIR, 'star_measurements_mapping.json')
+    TEMP_DIR: str = tempfile.mkdtemp()
+    UPLOAD_FOLDER: str = 'uploads'
+    GENERATED_FOLDER: str = 'generated_clothes'
+    ALLOWED_EXTENSIONS: set = None
+    MAX_CONTENT_LENGTH: int = 32 * 1024 * 1024  # 32MB
+    CACHE_SIZE: int = 128
+    THREAD_POOL_SIZE: int = min(8, os.cpu_count() or 4)
+    MEMORY_LIMIT_MB: int = 1024
     
-    n_betas = min(10, shapedirs.shape[2])
-    
-    def objective(betas):
-        vertices_deformed = v_template + np.sum(shapedirs[:, :, :n_betas] * betas[None, None, :], axis=2)
-        joints_deformed = J_regressor.dot(vertices_deformed)
-        
-        mesures_modele = {}
-        for mesure in mesures_cibles.keys():
-            if mesure in mesures_actuelles:
-                ratio = mesures_cibles[mesure] / mesures_actuelles[mesure] if mesures_actuelles[mesure] > 0 else 1.0
-                mesures_modele[mesure] = mesures_actuelles[mesure] * ratio
-        
-        error = 0
-        for mesure in mesures_cibles.keys():
-            if mesure in mesures_modele:
-                error += (mesures_modele[mesure] - mesures_cibles[mesure]) ** 2
-        
-        regularization = 0.1 * np.sum(betas ** 2)
-        return error + regularization
-    
-    initial_betas = np.zeros(n_betas)
-    bounds = [(-3, 3)] * n_betas
-    
-    result = minimize(objective, initial_betas, method='L-BFGS-B', bounds=bounds)
-    optimal_betas = result.x
-    
-    vertices_final = v_template + np.sum(shapedirs[:, :, :n_betas] * optimal_betas[None, None, :], axis=2)
-    
-    return vertices_final, optimal_betas
+    def __post_init__(self):
+        self.ALLOWED_EXTENSIONS = {'obj', 'npz', 'ply'}
+        # Création des dossiers nécessaires
+        for folder in [self.UPLOAD_FOLDER, self.GENERATED_FOLDER]:
+            os.makedirs(folder, exist_ok=True)
 
-def get_model_info(model_data):
-    """Récupère les informations sur le modèle"""
-    info = {
-        'vertices_count': len(model_data['v_template']),
-        'faces_count': len(model_data['f']),
-        'joints_count': len(model_data['Jtr']),
-        'has_shapedirs': model_data['shapedirs'] is not None,
-        'has_posedirs': model_data['posedirs'] is not None
-    }
+config = Config()
+
+app.config.update({
+    'UPLOAD_FOLDER': config.UPLOAD_FOLDER,
+    'GENERATED_FOLDER': config.GENERATED_FOLDER,
+    'MAX_CONTENT_LENGTH': config.MAX_CONTENT_LENGTH,
+    'JSON_SORT_KEYS': False  # Optimisation JSON
+})
+
+# Pool de threads global pour les opérations parallèles
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=config.THREAD_POOL_SIZE)
+
+# Cache thread-safe avec limitation de mémoire
+class ThreadSafeCache:
+    def __init__(self, max_size=config.CACHE_SIZE, max_memory_mb=config.MEMORY_LIMIT_MB):
+        self.cache = {}
+        self.access_times = {}
+        self.max_size = max_size
+        self.max_memory_mb = max_memory_mb
+        self.lock = threading.RLock()
+        self._memory_check_counter = 0
     
-    if model_data['shapedirs'] is not None:
-        info['shape_parameters_count'] = model_data['shapedirs'].shape[2]
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.access_times[key] = time.time()
+                return self.cache[key]
+            return None
     
-    return info
+    def set(self, key, value):
+        with self.lock:
+            # Vérification périodique de la mémoire
+            self._memory_check_counter += 1
+            if self._memory_check_counter % 10 == 0:
+                self._cleanup_memory()
+            
+            # Nettoyage LRU si nécessaire
+            if len(self.cache) >= self.max_size:
+                self._evict_lru()
+            
+            self.cache[key] = value
+            self.access_times[key] = time.time()
+    
+    def _evict_lru(self):
+        if not self.access_times:
+            return
+        lru_key = min(self.access_times.keys(), key=self.access_times.get)
+        del self.cache[lru_key]
+        del self.access_times[lru_key]
+    
+    def _cleanup_memory(self):
+        process = psutil.Process()
+        memory_mb = process.memory_info().rss / 1024 / 1024
+        if memory_mb > self.max_memory_mb:
+            # Nettoyer 25% du cache
+            cleanup_count = max(1, len(self.cache) // 4)
+            sorted_keys = sorted(self.access_times.keys(), key=self.access_times.get)
+            for key in sorted_keys[:cleanup_count]:
+                del self.cache[key]
+                del self.access_times[key]
+            gc.collect()  # Force garbage collection
+            logger.warning(f"Cache nettoyé: mémoire {memory_mb:.1f}MB > {self.max_memory_mb}MB")
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.access_times.clear()
+            gc.collect()
 
+# Caches optimisés
+models_cache = ThreadSafeCache(max_size=32, max_memory_mb=512)
+measurements_cache = ThreadSafeCache(max_size=64, max_memory_mb=128)
+clothing_cache = ThreadSafeCache(max_size=128, max_memory_mb=256)
 
-# _________________________________________________________fonction_pour_generation_vetement_____________________________________________________________________
+# Optimisation des couleurs et vêtements avec numpy arrays
+COULEURS_RGB = np.array([
+    [25, 25, 25],           # Noir
+    [25, 25, 128],          # Bleu Marine
+    [77, 77, 77],           # Gris Anthracite
+    [128, 25, 51],          # Bordeaux
+    [204, 25, 25],          # Rouge
+    [77, 102, 204],         # Bleu Clair
+    [102, 128, 51],         # Vert Olive
+    [102, 77, 51],          # Marron
+    [230, 230, 217],        # Blanc Cassé
+    [204, 153, 179],        # Rose Poudré
+], dtype=np.uint8)
 
-# --- COULEURS DISPONIBLES ---
-COULEURS_DISPONIBLES = {
-    "Noir": [25, 25, 25],
-    "Bleu Marine": [25, 25, 128],
-    "Gris Anthracite": [77, 77, 77],
-    "Bordeaux": [128, 25, 51],
-    "Rouge": [204, 25, 25],
-    "Bleu Clair": [77, 102, 204],
-    "Vert Olive": [102, 128, 51],
-    "Marron": [102, 77, 51],
-    "Blanc Cassé": [230, 230, 217],
-    "Rose Poudré": [204, 153, 179],
-}
+COULEURS_NOMS = [
+    "Noir", "Bleu Marine", "Gris Anthracite", "Bordeaux", "Rouge",
+    "Bleu Clair", "Vert Olive", "Marron", "Blanc Cassé", "Rose Poudré"
+]
 
-# --- TYPES DE VETEMENTS ---
+COULEURS_DISPONIBLES = dict(zip(COULEURS_NOMS, COULEURS_RGB.tolist()))
+
+# Structure optimisée pour les types de vêtements
+@dataclass
+class ClothingParams:
+    categorie: str
+    type: str
+    longueur_relative: float
+    description: str
+    ampleur: Optional[float] = None
+    evasement: Optional[float] = None
+
 TYPES_VETEMENTS = {
-    # Jupes droites
-    "Mini-jupe droite": {
-        "categorie": "jupe",
-        "type": "droite",
-        "longueur_relative": 0.15, 
-        "description": "Mini-jupe droite (mi-cuisse)"
-    },
-    "Jupe droite au genou": {
-        "categorie": "jupe",
-        "type": "droite",
-        "longueur_relative": 0.35, 
-        "description": "Jupe droite classique (genou)"
-    },
-    "Jupe droite longue": {
-        "categorie": "jupe",
-        "type": "droite",
-        "longueur_relative": 0.75, 
-        "description": "Jupe droite longue (cheville)"
-    },
+    # Jupes droites - optimisées
+    "Mini-jupe droite": ClothingParams("jupe", "droite", 0.15, "Mini-jupe droite (mi-cuisse)"),
+    "Jupe droite au genou": ClothingParams("jupe", "droite", 0.35, "Jupe droite classique (genou)"),
+    "Jupe droite longue": ClothingParams("jupe", "droite", 0.75, "Jupe droite longue (cheville)"),
     
     # Jupes ovales
-    "Mini-jupe ovale": {
-        "categorie": "jupe",
-        "type": "ovale",
-        "longueur_relative": 0.15,
-        "ampleur": 1.3,
-        "description": "Mini-jupe ovale évasée (mi-cuisse)"
-    },
-    "Jupe ovale au genou": {
-        "categorie": "jupe",
-        "type": "ovale",
-        "longueur_relative": 0.35,
-        "ampleur": 1.4,
-        "description": "Jupe ovale classique (genou)"
-    },
-    "Jupe ovale longue": {
-        "categorie": "jupe",
-        "type": "ovale",
-        "longueur_relative": 0.75,
-        "ampleur": 1.5,
-        "description": "Jupe ovale longue (cheville)"
-    },
-    "Jupe ovale bouffante": {
-        "categorie": "jupe",
-        "type": "ovale",
-        "longueur_relative": 0.35,
-        "ampleur": 1.8,
-        "description": "Jupe ovale très évasée (style bouffant)"
-    },
+    "Mini-jupe ovale": ClothingParams("jupe", "ovale", 0.15, "Mini-jupe ovale évasée (mi-cuisse)", ampleur=1.3),
+    "Jupe ovale au genou": ClothingParams("jupe", "ovale", 0.35, "Jupe ovale classique (genou)", ampleur=1.4),
+    "Jupe ovale longue": ClothingParams("jupe", "ovale", 0.75, "Jupe ovale longue (cheville)", ampleur=1.5),
+    "Jupe ovale bouffante": ClothingParams("jupe", "ovale", 0.35, "Jupe ovale très évasée (style bouffant)", ampleur=1.8),
     
     # Jupes trapèze
-    "Mini-jupe trapèze": {
-        "categorie": "jupe",
-        "type": "trapeze",
-        "longueur_relative": 0.15,
-        "evasement": 1.4,
-        "description": "Mini-jupe trapèze évasée (mi-cuisse)"
-    },
-    "Jupe trapèze au genou": {
-        "categorie": "jupe",
-        "type": "trapeze",
-        "longueur_relative": 0.35,
-        "evasement": 1.6,
-        "description": "Jupe trapèze classique (genou)"
-    },
-    "Jupe trapèze longue": {
-        "categorie": "jupe",
-        "type": "trapeze",
-        "longueur_relative": 0.75,
-        "evasement": 1.8,
-        "description": "Jupe trapèze longue (cheville)"
-    },
-    "Jupe trapèze évasée": {
-        "categorie": "jupe",
-        "type": "trapeze",
-        "longueur_relative": 0.45,
-        "evasement": 2.0,
-        "description": "Jupe trapèze très évasée (style A-line)"
-    },
+    "Mini-jupe trapèze": ClothingParams("jupe", "trapeze", 0.15, "Mini-jupe trapèze évasée (mi-cuisse)", evasement=1.4),
+    "Jupe trapèze au genou": ClothingParams("jupe", "trapeze", 0.35, "Jupe trapèze classique (genou)", evasement=1.6),
+    "Jupe trapèze longue": ClothingParams("jupe", "trapeze", 0.75, "Jupe trapèze longue (cheville)", evasement=1.8),
+    "Jupe trapèze évasée": ClothingParams("jupe", "trapeze", 0.45, "Jupe trapèze très évasée (style A-line)", evasement=2.0),
 }
 
-# --- FONCTIONS UTILITAIRES ---
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# Décorateurs utilitaires optimisés
+def timing_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        duration = time.perf_counter() - start
+        logger.debug(f"{func.__name__} executed in {duration:.3f}s")
+        return result
+    return wrapper
 
-def detecter_points_anatomiques(verts):
-    """
-    Détection avancée des points anatomiques avec gestion des bras
-    """
-    y_vals = verts[:, 1]
-    x_vals = verts[:, 0]
-    z_vals = verts[:, 2]
+def memory_monitor(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        process = psutil.Process()
+        mem_before = process.memory_info().rss / 1024 / 1024
+        result = func(*args, **kwargs)
+        mem_after = process.memory_info().rss / 1024 / 1024
+        mem_diff = mem_after - mem_before
+        if mem_diff > 50:  # Plus de 50MB de différence
+            logger.warning(f"{func.__name__} used {mem_diff:.1f}MB memory")
+        return result
+    return wrapper
+
+@contextmanager
+def error_handler(operation_name="Operation"):
+    try:
+        start_time = time.perf_counter()
+        yield
+        duration = time.perf_counter() - start_time
+        logger.debug(f"{operation_name} completed in {duration:.3f}s")
+    except Exception as e:
+        logger.error(f"{operation_name} failed: {str(e)}")
+        raise
+
+# Classe principale ultra-optimisée
+class STARClothingGeneratorOptimized:
+    """Générateur STAR optimisé pour haute performance"""
     
-    # Points de base
-    y_max = np.max(y_vals)
-    y_min = np.min(y_vals)
-    hauteur_totale = y_max - y_min
+    def __init__(self):
+        self.mapping_cache_data = None
+        self._load_mapping_lazy()
+        self.computation_cache = {}
+        self.vectorized_functions = self._setup_vectorized_functions()
+        logger.info("STARClothingGenerator optimisé initialisé")
     
-    # Points anatomiques détaillés
-    y_tete = y_max - 0.1 * hauteur_totale
-    y_epaules = y_max - 0.2 * hauteur_totale
-    y_taille = y_max - 0.3 * hauteur_totale
-    y_hanches = y_max - 0.45 * hauteur_totale
-    y_genoux = y_max - 0.75 * hauteur_totale
+    def _load_mapping_lazy(self):
+        """Chargement paresseux du mapping"""
+        def _load():
+            if self.mapping_cache_data is None:
+                with open(config.MAPPING_PATH, 'r', encoding='utf-8') as f:
+                    self.mapping_cache_data = json.load(f)
+            return self.mapping_cache_data
+        return _load
     
-    def calculer_rayon_a_hauteur(y_target, tolerance=0.05):
+    def _setup_vectorized_functions(self):
+        """Configuration des fonctions vectorisées"""
+        return {
+            'distance_calculation': np.vectorize(self._calculate_distance_optimized),
+            'radius_calculation': self._calculate_radius_vectorized
+        }
+    
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _calculate_distance_optimized(p1: tuple, p2: tuple) -> float:
+        """Calcul de distance optimisé avec cache"""
+        return np.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
+    
+    @staticmethod
+    def _calculate_radius_vectorized(vertices: np.ndarray, y_target: float, tolerance: float = 0.05) -> float:
+        """Calcul de rayon vectorisé ultra-rapide"""
+        y_vals = vertices[:, 1]
         mask = np.abs(y_vals - y_target) < tolerance
+        
         if not np.any(mask):
             return 0.1
-        points_niveau = verts[mask]
-        distances = np.sqrt(points_niveau[:, 0]**2 + points_niveau[:, 2]**2)
-        return np.percentile(distances, 75)
+        
+        points = vertices[mask]
+        distances = np.sqrt(np.sum(points[:, [0, 2]] ** 2, axis=1))
+        return np.percentile(distances, 75) if len(distances) > 0 else 0.1
     
-    # Rayons à différents niveaux
-    rayon_tete = calculer_rayon_a_hauteur(y_tete)
-    rayon_epaules = calculer_rayon_a_hauteur(y_epaules)
-    rayon_taille = calculer_rayon_a_hauteur(y_taille)
-    rayon_hanches = calculer_rayon_a_hauteur(y_hanches)
-    
-    # Détection des bras
-    mask_zone_bras = (y_vals <= y_epaules) & (y_vals >= y_hanches)
-    points_zone_bras = verts[mask_zone_bras]
-    distances_radiales = np.sqrt(points_zone_bras[:, 0]**2 + points_zone_bras[:, 2]**2)
-    seuil_bras = np.percentile(distances_radiales, 85)
-    
-    return {
-        'y_tete': y_tete,
-        'y_epaules': y_epaules,
-        'y_taille': y_taille,
-        'y_hanches': y_hanches,
-        'y_genoux': y_genoux,
-        'y_min': y_min,
-        'y_max': y_max,
-        'hauteur_totale': hauteur_totale,
-        'rayon_tete': rayon_tete,
-        'rayon_epaules': rayon_epaules,
-        'rayon_taille': rayon_taille,
-        'rayon_hanches': rayon_hanches,
-        'seuil_bras': seuil_bras
-    }
-
-def calculer_profil_jupe_droite(points_anat, longueur_relative):
-    """
-    Calcule le profil d'une jupe droite avec la longueur spécifiée
-    """
-    y_taille = points_anat['y_taille']
-    y_hanches = points_anat['y_hanches']
-    y_min = points_anat['y_min']
-    hauteur_totale = points_anat['hauteur_totale']
-    
-    rayon_taille = points_anat['rayon_taille']
-    rayon_hanches = points_anat['rayon_hanches']
-    
-    y_debut_jupe = y_taille - 0.03
-    y_bas_jupe = y_hanches - (longueur_relative * hauteur_totale)
-    y_bas_jupe = max(y_bas_jupe, y_min + 0.1)
-    
-    rayon_debut = rayon_taille * 0.88
-    rayon_hanches_jupe = rayon_hanches * 0.95
-    rayon_bas = rayon_hanches_jupe * 1.02
-    
-    def rayon_a_hauteur(y):
-        if y > y_debut_jupe:
-            return 0
-        elif y >= y_hanches:
-            if y_debut_jupe == y_hanches:
-                return rayon_debut
-            t = (y_debut_jupe - y) / (y_debut_jupe - y_hanches)
-            return rayon_debut + t * (rayon_hanches_jupe - rayon_debut)
-        elif y >= y_bas_jupe:
-            if y_hanches == y_bas_jupe:
-                return rayon_hanches_jupe
-            t = (y_hanches - y) / (y_hanches - y_bas_jupe)
-            return rayon_hanches_jupe + t * (rayon_bas - rayon_hanches_jupe)
-        else:
-            return 0
-    
-    return {
-        'y_debut': y_debut_jupe,
-        'y_bas': y_bas_jupe,
-        'rayon_fonction': rayon_a_hauteur,
-        'rayon_debut': rayon_debut,
-        'rayon_hanches': rayon_hanches_jupe,
-        'rayon_bas': rayon_bas
-    }
-
-def calculer_profil_jupe_ovale(points_anat, longueur_relative, ampleur=1.4):
-    """
-    Calcule le profil d'une jupe ovale avec forme arrondie
-    """
-    y_taille = points_anat['y_taille']
-    y_hanches = points_anat['y_hanches']
-    y_min = points_anat['y_min']
-    hauteur_totale = points_anat['hauteur_totale']
-    
-    rayon_taille = points_anat['rayon_taille']
-    rayon_hanches = points_anat['rayon_hanches']
-    
-    y_debut_jupe = y_taille - 0.03
-    y_bas_jupe = y_hanches - (longueur_relative * hauteur_totale)
-    y_bas_jupe = max(y_bas_jupe, y_min + 0.1)
-    
-    rayon_debut = rayon_taille * 0.88
-    rayon_max = rayon_hanches * ampleur
-    rayon_bas = rayon_hanches * 0.9
-    
-    y_max_largeur = y_hanches - 0.1
-    
-    def rayon_a_hauteur(y):
-        if y > y_debut_jupe:
-            return 0
-        elif y >= y_max_largeur:
-            if y_debut_jupe == y_max_largeur:
-                return rayon_debut
-            t = (y_debut_jupe - y) / (y_debut_jupe - y_max_largeur)
-            t_curve = 0.5 * (1 - np.cos(np.pi * t))
-            return rayon_debut + t_curve * (rayon_max - rayon_debut)
-        elif y >= y_bas_jupe:
-            if y_max_largeur == y_bas_jupe:
-                return rayon_max
-            t = (y_max_largeur - y) / (y_max_largeur - y_bas_jupe)
-            t_curve = 0.5 * (1 + np.cos(np.pi * t))
-            return rayon_max - (rayon_max - rayon_bas) * (1 - t_curve)
-        else:
-            return 0
-    
-    return {
-        'y_debut': y_debut_jupe,
-        'y_bas': y_bas_jupe,
-        'y_max_largeur': y_max_largeur,
-        'rayon_fonction': rayon_a_hauteur,
-        'rayon_debut': rayon_debut,
-        'rayon_max': rayon_max,
-        'rayon_bas': rayon_bas
-    }
-
-def calculer_profil_jupe_trapeze(points_anat, longueur_relative, evasement=1.6):
-    """
-    Calcule le profil d'une jupe trapèze avec évasement linéaire
-    """
-    y_taille = points_anat['y_taille']
-    y_hanches = points_anat['y_hanches']
-    y_min = points_anat['y_min']
-    hauteur_totale = points_anat['hauteur_totale']
-    
-    rayon_taille = points_anat['rayon_taille']
-    rayon_hanches = points_anat['rayon_hanches']
-    
-    y_debut_jupe = y_taille - 0.03
-    y_bas_jupe = y_hanches - (longueur_relative * hauteur_totale)
-    y_bas_jupe = max(y_bas_jupe, y_min + 0.1)
-    
-    rayon_debut = rayon_taille * 0.88
-    rayon_bas = rayon_hanches * evasement
-    
-    def rayon_a_hauteur(y):
-        if y > y_debut_jupe:
-            return 0
-        elif y >= y_bas_jupe:
-            if y_debut_jupe == y_bas_jupe:
-                return rayon_debut
-            t = (y_debut_jupe - y) / (y_debut_jupe - y_bas_jupe)
-            return rayon_debut + t * (rayon_bas - rayon_debut)
-        else:
-            return 0
-    
-    return {
-        'y_debut': y_debut_jupe,
-        'y_bas': y_bas_jupe,
-        'rayon_fonction': rayon_a_hauteur,
-        'rayon_debut': rayon_debut,
-        'rayon_bas': rayon_bas
-    }
-
-def appliquer_forme_jupe(verts, profil_jupe):
-    """
-    Applique la forme de jupe aux vertices
-    """
-    verts_modifies = verts.copy()
-    y_vals = verts[:, 1]
-    
-    masque_jupe = (y_vals <= profil_jupe['y_debut']) & (y_vals >= profil_jupe['y_bas'])
-    
-    for i, (x, y, z) in enumerate(verts):
-        if masque_jupe[i]:
-            distance_actuelle = np.sqrt(x**2 + z**2)
+    @timing_decorator
+    @memory_monitor
+    def charger_modele_star_optimized(self, npz_path: str) -> Dict[str, Any]:
+        """Chargement de modèle STAR ultra-optimisé"""
+        cache_key = f"model_{npz_path}_{os.path.getmtime(npz_path)}"
+        
+        cached_model = models_cache.get(cache_key)
+        if cached_model:
+            logger.info(f"Modèle chargé depuis le cache: {npz_path}")
+            return cached_model
+        
+        with error_handler(f"Chargement modèle {npz_path}"):
+            # Chargement optimisé avec mmap pour les gros fichiers
+            data = np.load(npz_path, mmap_mode='r' if os.path.getsize(npz_path) > 100*1024*1024 else None)
             
-            if distance_actuelle > 0.001:
-                nouveau_rayon = profil_jupe['rayon_fonction'](y)
-                
-                if nouveau_rayon > 0:
-                    facteur = nouveau_rayon / distance_actuelle
-                    verts_modifies[i, 0] = x * facteur
-                    verts_modifies[i, 2] = z * facteur
-    
-    return verts_modifies, masque_jupe
-
-def lisser_jupe(verts, masque_jupe, iterations=2):
-    """
-    Lisse la surface de la jupe
-    """
-    verts_lisses = verts.copy()
-    
-    for _ in range(iterations):
-        nouveaux_verts = verts_lisses.copy()
-        
-        for i, est_jupe in enumerate(masque_jupe):
-            if est_jupe:
-                distances = np.linalg.norm(verts_lisses - verts_lisses[i], axis=1)
-                voisins = np.where((distances < 0.03) & (distances > 0))[0]
-                
-                if len(voisins) > 2:
-                    poids_centre = 0.75
-                    poids_voisins = (1 - poids_centre) / len(voisins)
-                    
-                    nouveaux_verts[i] = (poids_centre * verts_lisses[i] + 
-                                       poids_voisins * np.sum(verts_lisses[voisins], axis=0))
-        
-        verts_lisses = nouveaux_verts
-    
-    return verts_lisses
-
-def creer_mesh_jupe_separe(verts_corps, masque_jupe, couleur_nom):
-    """
-    Crée un mesh séparé pour la jupe avec la couleur appropriée
-    """
-    points_jupe = verts_corps[masque_jupe]
-    
-    if len(points_jupe) == 0:
-        logger.warning("Aucun point de jupe trouvé")
-        return None
-    
-    faces = []
-    indices_jupe = np.where(masque_jupe)[0]
-    
-    y_vals = points_jupe[:, 1]
-    y_unique = np.unique(y_vals)
-    
-    for i in range(len(y_unique) - 1):
-        y_actuel = y_unique[i]
-        y_suivant = y_unique[i + 1]
-        
-        idx_actuel = np.where(np.abs(points_jupe[:, 1] - y_actuel) < 0.01)[0]
-        idx_suivant = np.where(np.abs(points_jupe[:, 1] - y_suivant) < 0.01)[0]
-        
-        if len(idx_actuel) > 2 and len(idx_suivant) > 2:
-            angles_actuel = np.arctan2(points_jupe[idx_actuel, 2], points_jupe[idx_actuel, 0])
-            angles_suivant = np.arctan2(points_jupe[idx_suivant, 2], points_jupe[idx_suivant, 0])
-            
-            idx_actuel = idx_actuel[np.argsort(angles_actuel)]
-            idx_suivant = idx_suivant[np.argsort(angles_suivant)]
-            
-            n_min = min(len(idx_actuel), len(idx_suivant))
-            for j in range(n_min):
-                k = (j + 1) % n_min
-                faces.append([idx_actuel[j], idx_suivant[j], idx_actuel[k]])
-                faces.append([idx_suivant[j], idx_suivant[k], idx_actuel[k]])
-    
-    try:
-        mesh_jupe = Mesh([points_jupe, faces])
-        couleur_rgb = COULEURS_DISPONIBLES[couleur_nom]
-        mesh_jupe.color(couleur_rgb).alpha(0.9)
-        return mesh_jupe
-    except Exception as e:
-        logger.warning(f"Erreur création mesh jupe: {e}")
-        try:
-            mesh_jupe = Mesh(points_jupe)
-            couleur_rgb = COULEURS_DISPONIBLES[couleur_nom]
-            mesh_jupe.color(couleur_rgb).alpha(0.9)
-            return mesh_jupe
-        except Exception as e2:
-            logger.error(f"Impossible de créer le mesh jupe: {e2}")
-            return None
-
-def generer_vetement(mesh_corps, nom_vetement, couleur_nom):
-    """
-    Génère un vêtement selon les paramètres spécifiés
-    """
-    logger.info(f"Génération d'un(e) {nom_vetement.lower()}")
-    
-    verts = mesh_corps.points.copy()
-    
-    # Détecter les points anatomiques
-    points_anat = detecter_points_anatomiques(verts)
-    
-    # Récupérer les paramètres du vêtement
-    params_vetement = TYPES_VETEMENTS[nom_vetement]
-    categorie = params_vetement["categorie"]
-    type_vetement = params_vetement["type"]
-    longueur_relative = params_vetement["longueur_relative"]
-    
-    # Calculer le profil selon le type de vêtement
-    if categorie == "jupe":
-        if type_vetement == "droite":
-            profil_vetement = calculer_profil_jupe_droite(points_anat, longueur_relative)
-        elif type_vetement == "ovale":
-            ampleur = params_vetement.get("ampleur", 1.4)
-            profil_vetement = calculer_profil_jupe_ovale(points_anat, longueur_relative, ampleur)
-        elif type_vetement == "trapeze":
-            evasement = params_vetement.get("evasement", 1.6)
-            profil_vetement = calculer_profil_jupe_trapeze(points_anat, longueur_relative, evasement)
-        
-        # Appliquer la forme
-        verts_modifies, masque_vetement = appliquer_forme_jupe(verts, profil_vetement)
-        
-        # Lisser
-        verts_finaux = lisser_jupe(verts_modifies, masque_vetement, 1)
-        
-        # Créer le mesh
-        mesh_vetement = creer_mesh_jupe_separe(verts_finaux, masque_vetement, couleur_nom)
-    
-    else:
-        raise ValueError(f"Catégorie de vêtement non reconnue: {categorie}")
-    
-    # Modifier le mesh du corps
-    mesh_corps.points = verts_finaux
-    mesh_corps.color([255, 217, 179]).alpha(0.8)
-    
-    return mesh_corps, mesh_vetement
-
-def sauvegarder_vetement(mesh_vetement, dossier, nom="vetement"):
-    """Sauvegarde le mesh du vêtement"""
-    if mesh_vetement is None:
-        logger.error("Aucun mesh à sauvegarder !")
-        return None
-    
-    os.makedirs(dossier, exist_ok=True)
-    chemin = os.path.join(dossier, f"{nom}.obj")
-    
-    try:
-        mesh_vetement.write(chemin)
-        logger.info(f"Fichier sauvegardé : {chemin}")
-        return chemin
-    except Exception as e:
-        logger.error(f"Impossible de sauvegarder : {e}")
-        return None
-
-# --- ROUTES API ---
-
-# --- API ENDPOINTS ---
-
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Vérification de l'état de l'API"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0'
-    })
-
-@app.route('/api/models/available', methods=['GET'])
-def get_available_models():
-    """Récupère la liste des modèles disponibles"""
-    try:
-        available_models = []
-        for gender in ['male', 'female', 'neutral']:
-            npz_path = os.path.join(BASE_DIR, gender, f"{gender}.npz")
-            if os.path.exists(npz_path):
-                available_models.append({
-                    'gender': gender,
-                    'path': npz_path,
-                    'available': True
-                })
-            else:
-                available_models.append({
-                    'gender': gender,
-                    'path': npz_path,
-                    'available': False
-                })
-        
-        return jsonify({
-            'success': True,
-            'models': available_models,
-            'base_dir': BASE_DIR
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/load', methods=['POST'])
-def load_model(gender):
-    """Charge un modèle STAR spécifique"""
-    try:
-        if gender not in ['male', 'female', 'neutral']:
-            return jsonify({
-                'success': False,
-                'error': 'Genre invalide. Utilisez: male, female, ou neutral'
-            }), 400
-        
-        npz_path = os.path.join(BASE_DIR, gender, f"{gender}.npz")
-        if not os.path.exists(npz_path):
-            return jsonify({
-                'success': False,
-                'error': f'Modèle {gender} non trouvé à {npz_path}'
-            }), 404
-        
-        # Charger le modèle
-        model_data = charger_modele_star(npz_path)
-        
-        # Mettre en cache
-        models_cache[gender] = model_data
-        
-        # Récupérer les informations du modèle
-        model_info = get_model_info(model_data)
-        
-        return jsonify({
-            'success': True,
-            'gender': gender,
-            'model_info': model_info,
-            'message': f'Modèle {gender} chargé avec succès'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/measurements/mapping', methods=['GET'])
-def get_measurements_mapping():
-    """Récupère le mapping des mesures"""
-    try:
-        mapping = charger_mapping()
-        return jsonify({
-            'success': True,
-            'mapping': mapping,
-            'measurements_count': len(mapping)
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/measurements', methods=['GET'])
-def get_model_measurements(gender):
-    """Calcule les mesures actuelles d'un modèle"""
-    try:
-        if gender not in models_cache:
-            return jsonify({
-                'success': False,
-                'error': f'Modèle {gender} non chargé. Chargez-le d\'abord.'
-            }), 400
-        
-        model_data = models_cache[gender]
-        mapping = charger_mapping()
-        
-        # Calculer les mesures
-        mesures = calculer_mesures_modele(
-            model_data['v_template'], 
-            model_data['Jtr'], 
-            mapping
-        )
-        
-        return jsonify({
-            'success': True,
-            'gender': gender,
-            'measurements': mesures,
-            'measurements_count': len(mesures)
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/deform', methods=['POST'])
-def deform_model(gender):
-    """Déforme un modèle selon des mesures cibles"""
-    try:
-        if gender not in models_cache:
-            return jsonify({
-                'success': False,
-                'error': f'Modèle {gender} non chargé. Chargez-le d\'abord.'
-            }), 400
-        
-        data = request.get_json()
-        if not data or 'target_measurements' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'Mesures cibles manquantes dans le body'
-            }), 400
-        
-        target_measurements = data['target_measurements']
-        
-        # Valider les mesures
-        if not isinstance(target_measurements, dict):
-            return jsonify({
-                'success': False,
-                'error': 'Les mesures doivent être un dictionnaire'
-            }), 400
-        
-        # Convertir les valeurs en float et valider
-        try:
-            validated_measurements = {}
-            for key, value in target_measurements.items():
-                float_value = float(value)
-                if float_value <= 0:
-                    return jsonify({
-                        'success': False,
-                        'error': f'Mesure {key} doit être positive'
-                    }), 400
-                validated_measurements[key] = float_value
-        except ValueError as e:
-            return jsonify({
-                'success': False,
-                'error': f'Valeur de mesure invalide: {str(e)}'
-            }), 400
-        
-        model_data = models_cache[gender]
-        mapping = charger_mapping()
-        
-        # Calculer les mesures actuelles
-        current_measurements = calculer_mesures_modele(
-            model_data['v_template'], 
-            model_data['Jtr'], 
-            mapping
-        )
-        
-        # Déformer le modèle
-        deformed_vertices, shape_params = deformer_modele(
-            model_data['v_template'],
-            model_data['shapedirs'],
-            validated_measurements,
-            current_measurements,
-            model_data['J_regressor']
-        )
-        
-        # Calculer les nouvelles mesures
-        new_joints = model_data['J_regressor'].dot(deformed_vertices)
-        new_measurements = calculer_mesures_modele(deformed_vertices, new_joints, mapping)
-        
-        # Sauvegarder le modèle déformé
-        deformed_model_id = str(uuid.uuid4())
-        models_cache[f"{gender}_deformed_{deformed_model_id}"] = {
-            **model_data,
-            'v_deformed': deformed_vertices,
-            'shape_params': shape_params,
-            'deformed_joints': new_joints,
-            'target_measurements': validated_measurements,
-            'achieved_measurements': new_measurements
-        }
-        
-        return jsonify({
-            'success': True,
-            'gender': gender,
-            'deformed_model_id': deformed_model_id,
-            'shape_parameters': shape_params.tolist(),
-            'target_measurements': validated_measurements,
-            'achieved_measurements': new_measurements,
-            'current_measurements': current_measurements,
-            'message': 'Modèle déformé avec succès'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/export/obj', methods=['GET'])
-def export_model_obj(gender):
-    """Exporte un modèle en format OBJ"""
-    try:
-        # Vérifier si c'est un modèle déformé
-        deformed_model_id = request.args.get('deformed_model_id')
-        
-        if deformed_model_id:
-            model_key = f"{gender}_deformed_{deformed_model_id}"
-            if model_key not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': 'Modèle déformé non trouvé'
-                }), 404
-            
-            model_data = models_cache[model_key]
-            vertices = model_data['v_deformed']
-            filename = f"{gender}_deformed_{deformed_model_id}.obj"
-        else:
-            if gender not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': f'Modèle {gender} non chargé'
-                }), 400
-            
-            model_data = models_cache[gender]
-            vertices = model_data['v_template']
-            filename = f"{gender}_template.obj"
-        
-        # Créer le contenu OBJ
-        obj_content = "# Exported STAR model\n"
-        obj_content += f"# Vertices: {len(vertices)}\n"
-        obj_content += f"# Faces: {len(model_data['f'])}\n"
-        
-        if 'shape_params' in model_data:
-            params_str = ', '.join(f'{p:.3f}' for p in model_data['shape_params'])
-            obj_content += f"# Shape parameters: {params_str}\n"
-        
-        obj_content += "o STARMesh\n"
-        
-        # Vertices
-        for v in vertices:
-            obj_content += f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n"
-        
-        # Faces
-        for face in model_data['f']:
-            obj_content += f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n"
-        
-        # Créer un fichier temporaire
-        temp_file = os.path.join(TEMP_DIR, filename)
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            f.write(obj_content)
-        
-        return send_file(temp_file, as_attachment=True, download_name=filename)
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/vertices', methods=['GET'])
-def get_model_vertices(gender):
-    """Récupère les vertices d'un modèle"""
-    try:
-        deformed_model_id = request.args.get('deformed_model_id')
-        
-        if deformed_model_id:
-            model_key = f"{gender}_deformed_{deformed_model_id}"
-            if model_key not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': 'Modèle déformé non trouvé'
-                }), 404
-            
-            model_data = models_cache[model_key]
-            vertices = model_data['v_deformed']
-        else:
-            if gender not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': f'Modèle {gender} non chargé'
-                }), 400
-            
-            model_data = models_cache[gender]
-            vertices = model_data['v_template']
-        
-        return jsonify({
-            'success': True,
-            'gender': gender,
-            'vertices': vertices.tolist(),
-            'faces': model_data['f'].tolist(),
-            'vertices_count': len(vertices),
-            'faces_count': len(model_data['f'])
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/<gender>/joints', methods=['GET'])
-def get_model_joints(gender):
-    """Récupère les joints d'un modèle"""
-    try:
-        deformed_model_id = request.args.get('deformed_model_id')
-        
-        if deformed_model_id:
-            model_key = f"{gender}_deformed_{deformed_model_id}"
-            if model_key not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': 'Modèle déformé non trouvé'
-                }), 404
-            
-            model_data = models_cache[model_key]
-            joints = model_data['deformed_joints']
-        else:
-            if gender not in models_cache:
-                return jsonify({
-                    'success': False,
-                    'error': f'Modèle {gender} non chargé'
-                }), 400
-            
-            model_data = models_cache[gender]
-            joints = model_data['Jtr']
-        
-        return jsonify({
-            'success': True,
-            'gender': gender,
-            'joints': joints.tolist(),
-            'joints_count': len(joints)
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/cache/clear', methods=['POST'])
-def clear_cache():
-    """Vide le cache des modèles"""
-    try:
-        cleared_models = list(models_cache.keys())
-        models_cache.clear()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Cache vidé avec succès',
-            'cleared_models': cleared_models
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/models/cache/status', methods=['GET'])
-def get_cache_status():
-    """Récupère l'état du cache"""
-    try:
-        cache_info = {}
-        for key, model_data in models_cache.items():
-            cache_info[key] = {
-                'loaded': True,
-                'vertices_count': len(model_data.get('v_template', [])) if 'v_template' in model_data else len(model_data.get('v_deformed', [])),
-                'has_deformation': 'v_deformed' in model_data,
-                'has_shape_params': 'shape_params' in model_data
+            model_data = {
+                'v_template': np.array(data['v_template'], dtype=np.float32),  # Float32 pour économiser la mémoire
+                'f': np.array(data['f'], dtype=np.uint32),
+                'J_regressor': np.array(data['J_regressor'], dtype=np.float32) if 'J_regressor' in data else None,
+                'shapedirs': np.array(data['shapedirs'], dtype=np.float32) if 'shapedirs' in data else None,
+                'posedirs': np.array(data['posedirs'], dtype=np.float32) if 'posedirs' in data else None,
+                'metadata': {
+                    'file_path': npz_path,
+                    'loaded_at': time.time(),
+                    'file_size': os.path.getsize(npz_path)
+                }
             }
+            
+            # Calcul des joints si J_regressor existe
+            if model_data['J_regressor'] is not None:
+                model_data['Jtr'] = model_data['J_regressor'].dot(model_data['v_template'])
+            
+            models_cache.set(cache_key, model_data)
+            logger.info(f"Modèle chargé et mis en cache: {npz_path} ({os.path.getsize(npz_path)/1024/1024:.1f}MB)")
+            return model_data
+    
+    @timing_decorator
+    def calculer_mesures_modele_ultra_optimized(self, vertices: np.ndarray, joints: np.ndarray, mapping: Dict[str, Any]) -> Dict[str, float]:
+        """Calcul de mesures ultra-optimisé avec parallélisation intelligente"""
+        cache_key = f"measures_{hash(vertices.tobytes())}_{hash(str(mapping))}"
         
-        return jsonify({
-            'success': True,
-            'cache_info': cache_info,
-            'loaded_models_count': len(models_cache)
-        })
+        cached_measures = measurements_cache.get(cache_key)
+        if cached_measures:
+            return cached_measures
         
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        # Pré-calculs vectorisés
+        vertex_distances_precomputed = {}
+        
+        def calculate_single_measure(item):
+            mesure, info = item
+            joint_indices = info["joints"]
+            
+            if len(joint_indices) == 2:
+                # Distance directe entre deux joints
+                return mesure, float(np.linalg.norm(joints[joint_indices[1]] - joints[joint_indices[0]]))
+            
+            elif len(joint_indices) == 1:
+                joint_pos = joints[joint_indices[0]]
+                
+                # Utiliser le cache de distances pré-calculées
+                cache_key_local = joint_indices[0]
+                if cache_key_local not in vertex_distances_precomputed:
+                    distances = np.linalg.norm(vertices - joint_pos, axis=1)
+                    vertex_distances_precomputed[cache_key_local] = distances
+                else:
+                    distances = vertex_distances_precomputed[cache_key_local]
+                
+                # Optimisation: utiliser percentile au lieu de moyennes
+                threshold = np.percentile(distances, 20)
+                nearby_indices = distances < threshold
+                
+                if np.sum(nearby_indices) > 3:
+                    nearby_vertices = vertices[nearby_indices]
+                    center = np.mean(nearby_vertices, axis=0)
+                    radii = np.linalg.norm(nearby_vertices - center, axis=1)
+                    return mesure, float(2 * np.pi * np.mean(radii))
+                else:
+                    return mesure, 50.0
+            
+            return mesure, 0.0
+        
+        # Parallélisation adaptative
+        mapping_items = list(mapping.items())
+        if len(mapping_items) > 20:
+            # Utiliser le thread pool pour les gros modèles
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(mapping_items))) as executor:
+                results = list(executor.map(calculate_single_measure, mapping_items))
+        else:
+            # Séquentiel pour les petits modèles (éviter l'overhead)
+            results = [calculate_single_measure(item) for item in mapping_items]
+        
+        mesures = dict(results)
+        measurements_cache.set(cache_key, mesures)
+        return mesures
+    
+    @timing_decorator
+    def detecter_points_anatomiques_ultra_optimized(self, verts: np.ndarray) -> Dict[str, float]:
+        """Détection de points anatomiques ultra-rapide"""
+        # Calculs vectorisés en une seule passe
+        y_vals = verts[:, 1]
+        y_stats = {
+            'max': np.max(y_vals),
+            'min': np.min(y_vals),
+        }
+        y_stats['height'] = y_stats['max'] - y_stats['min']
+        
+        # Points anatomiques calculés vectoriellement
+        anatomical_ratios = np.array([0.1, 0.2, 0.3, 0.45, 0.75])
+        y_points = y_stats['max'] - anatomical_ratios * y_stats['height']
+        
+        # Calcul des rayons en parallèle avec numpy
+        radii = np.array([self._calculate_radius_vectorized(verts, y) for y in y_points[:4]])
+        
+        # Détection optimisée des bras avec masquage vectoriel
+        arm_zone_mask = (y_vals <= y_points[1]) & (y_vals >= y_points[3])
+        if np.any(arm_zone_mask):
+            arm_points = verts[arm_zone_mask]
+            arm_distances = np.sqrt(np.sum(arm_points[:, [0, 2]] ** 2, axis=1))
+            arm_threshold = np.percentile(arm_distances, 85) if len(arm_distances) > 0 else 0.3
+        else:
+            arm_threshold = 0.3
+        
+        return {
+            'y_tete': float(y_points[0]),
+            'y_epaules': float(y_points[1]),
+            'y_taille': float(y_points[2]),
+            'y_hanches': float(y_points[3]),
+            'y_genoux': float(y_points[4]),
+            'y_min': float(y_stats['min']),
+            'y_max': float(y_stats['max']),
+            'hauteur_totale': float(y_stats['height']),
+            'rayon_tete': float(radii[0]),
+            'rayon_epaules': float(radii[1]),
+            'rayon_taille': float(radii[2]),
+            'rayon_hanches': float(radii[3]),
+            'seuil_bras': float(arm_threshold)
+        }
+    
+    @timing_decorator
+    def deformer_modele_ultra_optimized(self, v_template: np.ndarray, shapedirs: Optional[np.ndarray],
+                                      mesures_cibles: Dict[str, float], mesures_actuelles: Dict[str, float],
+                                      J_regressor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Déformation de modèle ultra-optimisée"""
+        if shapedirs is None:
+            return v_template, np.zeros(10, dtype=np.float32)
+        
+        n_betas = min(10, shapedirs.shape[2])
+        
+        # Pré-calculs optimisés
+        mesures_communes = list(set(mesures_cibles.keys()) & set(mesures_actuelles.keys()))
+        if not mesures_communes:
+            return v_template, np.zeros(n_betas, dtype=np.float32)
+        
+        # Calculs vectorisés des ratios
+        ratios_array = np.array([
+            mesures_cibles[m] / max(mesures_actuelles[m], 1e-6) for m in mesures_communes
+        ], dtype=np.float32)
+        targets_array = np.array([mesures_cibles[m] for m in mesures_communes], dtype=np.float32)
+        
+        # Fonction objectif optimisée avec numba-like operations
+        def objective_ultra_optimized(betas):
+            # Déformation vectorisée
+            deformation = np.tensordot(shapedirs[:, :, :n_betas], betas, axes=([2], [0]))
+            vertices_deformed = v_template + deformation
+            
+            # Calcul d'erreur vectorisé
+            current_values = np.array([mesures_actuelles[m] for m in mesures_communes], dtype=np.float32)
+            scaled_values = current_values * ratios_array
+            error = np.sum((scaled_values - targets_array) ** 2)
+            
+            # Régularisation L2
+            regularization = 0.1 * np.sum(betas ** 2)
+            return float(error + regularization)
+        
+        # Optimisation avec bornes serrées
+        initial_betas = np.zeros(n_betas, dtype=np.float32)
+        bounds = [(-2.5, 2.5)] * n_betas  # Bornes plus serrées pour stabilité
+        
+        # Optimisation avec méthode adaptée
+        result = minimize(
+            objective_ultra_optimized, 
+            initial_betas, 
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 100, 'ftol': 1e-6}
+        )
+        
+        optimal_betas = result.x.astype(np.float32)
+        
+        # Application finale de la déformation
+        final_deformation = np.tensordot(shapedirs[:, :, :n_betas], optimal_betas, axes=([2], [0]))
+        vertices_final = v_template + final_deformation
+        
+        return vertices_final, optimal_betas
+    
+    @timing_decorator
+    def calculer_profil_jupe_optimized(self, points_anat: Dict[str, float], type_jupe: str,
+                                     longueur_relative: float, **kwargs) -> Dict[str, Any]:
+        """Calcul de profil de jupe optimisé avec fonctions pré-compilées"""
+        # Extraction optimisée des paramètres
+        y_taille, y_hanches, y_min = points_anat['y_taille'], points_anat['y_hanches'], points_anat['y_min']
+        hauteur_totale = points_anat['hauteur_totale']
+        rayon_taille, rayon_hanches = points_anat['rayon_taille'], points_anat['rayon_hanches']
+        
+        # Calculs de base vectorisés
+        y_debut_jupe = y_taille - 0.03
+        y_bas_jupe = max(y_hanches - (longueur_relative * hauteur_totale), y_min + 0.1)
+        rayon_debut = rayon_taille * 0.88
+        
+        # Fonctions spécialisées pour chaque type
+        if type_jupe == "droite":
+            rayon_hanches_jupe = rayon_hanches * 0.95
+            rayon_bas = rayon_hanches_jupe * 1.02
+            
+            def rayon_fonction(y):
+                y = np.atleast_1d(y)
+                result = np.zeros_like(y)
+                
+                # Conditions vectorisées
+                mask1 = y <= y_debut_jupe
+                mask2 = mask1 & (y >= y_hanches)
+                mask3 = mask1 & (y < y_hanches) & (y >= y_bas_jupe)
+                
+                # Calculs vectorisés
+                t2 = np.clip((y_debut_jupe - y[mask2]) / max(y_debut_jupe - y_hanches, 0.001), 0, 1)
+                result[mask2] = rayon_debut + t2 * (rayon_hanches_jupe - rayon_debut)
+                
+                t3 = np.clip((y_hanches - y[mask3]) / max(y_hanches - y_bas_jupe, 0.001), 0, 1)
+                result[mask3] = rayon_hanches_jupe + t3 * (rayon_bas - rayon_hanches_jupe)
+                
+                return result if result.shape else float(result)
+                
+        elif type_jupe == "ovale":
+            ampleur = kwargs.get('ampleur', 1.4)
+            rayon_max = rayon_hanches * ampleur
+            rayon_bas = rayon_hanches * 0.9
+            y_max_largeur = y_hanches - 0.1
+            
+            def rayon_fonction(y):
+                y = np.atleast_1d(y)
+                result = np.zeros_like(y)
+                
+                mask1 = y <= y_debut_jupe
+                mask2 = mask1 & (y >= y_max_largeur)
+                mask3 = mask1 & (y < y_max_largeur) & (y >= y_bas_jupe)
+                
+                t2 = np.clip((y_debut_jupe - y[mask2]) / max(y_debut_jupe - y_max_largeur, 0.001), 0, 1)
+                t_curve2 = 0.5 * (1 - np.cos(np.pi * t2))
+                result[mask2] = rayon_debut + t_curve2 * (rayon_max - rayon_debut)
+                
+                t3 = np.clip((y_max_largeur - y[mask3]) / max(y_max_largeur - y_bas_jupe, 0.001), 0, 1)
+                t_curve3 = 0.5 * (1 + np.cos(np.pi * t3))
+                result[mask3] = rayon_max - (rayon_max - rayon_bas) * (1 - t_curve3)
+                
+                return result if result.shape else float(result)
+                
+        elif type_jupe == "trapeze":
+            evasement = kwargs.get('evasement', 1.6)
+            rayon_bas = rayon_hanches * evasement
+            
+            def rayon_fonction(y):
+                y = np.atleast_1d(y)
+                result = np.zeros_like(y)
+                
+                mask = (y <= y_debut_jupe) & (y >= y_bas_jupe)
+                t = np.clip((y_debut_jupe - y[mask]) / max(y_debut_jupe - y_bas_jupe, 0.001), 0, 1)
+                result[mask] = rayon_debut + t * (rayon_bas - rayon_debut)
+                
+                return result if result.shape else float(result)
+        
+        else:
+            def rayon_fonction(y):
+                return 0.0
+        
+        return {
+            'y_debut': y_debut_jupe,
+            'y_bas': y_bas_jupe,
+            'rayon_fonction': rayon_fonction,
+            'type': type_jupe,
+            'computed_at': time.time()
+        }
+    
+    @timing_decorator
+    def appliquer_vetement_ultra_optimized(self, verts: np.ndarray, profil_vetement: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+        """Application de vêtement ultra-optimisée avec vectorisation complète"""
+        verts_modifies = verts.copy()
+        y_vals = verts[:, 1]
+        
+        # Masque vectorisé ultra-rapide
+        masque_vetement = (y_vals <= profil_vetement['y_debut']) & (y_vals >= profil_vetement['y_bas'])
+        indices_vetement = np.where(masque_vetement)[0]
+        
+        if len(indices_vetement) == 0:
+            return verts_modifies, masque_vetement
+        
+        # Calculs entièrement vectorisés
+        points_vetement = verts[indices_vetement]
+        distances_actuelles = np.sqrt(np.sum(points_vetement[:, [0, 2]] ** 2, axis=1))
+        
+        # Application vectorisée de la fonction rayon
+        y_points = points_vetement[:, 1]
+        nouveaux_rayons = profil_vetement['rayon_fonction'](y_points)
+        
+        # Masque de validation vectorisé
+        mask_valide = (distances_actuelles > 1e-6) & (nouveaux_rayons > 1e-6)
+        indices_valides = indices_vetement[mask_valide]
+        
+        if len(indices_valides) > 0:
+            # Facteurs de mise à l'échelle vectorisés
+            facteurs = nouveaux_rayons[mask_valide] / distances_actuelles[mask_valide]
+            
+            # Application vectorisée
+            verts_modifies[indices_valides, 0] *= facteurs
+            verts_modifies[indices_valides, 2] *= facteurs
+        
+        return verts_modifies, masque_vetement
+    
+    @timing_decorator
+    def generer_vetement_complet_ultra_optimized(self, npz_path: str, mesures_cibles: Dict[str, float],
+                                               type_vetement: str, couleur: str) -> Dict[str, Any]:
+        """Génération complète de vêtement ultra-optimisée"""
+        try:
+            # Validation des entrées
+            if type_vetement not in TYPES_VETEMENTS:
+                raise ValueError(f"Type de vêtement non supporté: {type_vetement}")
+            if couleur not in COULEURS_DISPONIBLES:
+                raise ValueError(f"Couleur non disponible: {couleur}")
+            
+            clothing_params = TYPES_VETEMENTS[type_vetement]
+            couleur_rgb = COULEURS_DISPONIBLES[couleur]
+            
+            # Chargement du modèle avec cache
+            model_data = self.charger_modele_star_optimized(npz_path)
+            v_template = model_data['v_template']
+            f = model_data['f']
+            shapedirs = model_data.get('shapedirs')
+            J_regressor = model_data.get('J_regressor')
+            
+            # Calcul des joints
+            if J_regressor is not None:
+                joints = J_regressor.dot(v_template)
+            else:
+                joints = np.zeros((24, 3), dtype=np.float32)
+            
+            # Calcul des mesures actuelles avec cache
+            if self.mapping_cache_data is None:
+                self._load_mapping_lazy()()
+            
+            mesures_actuelles = self.calculer_mesures_modele_ultra_optimized(
+                v_template, joints, self.mapping_cache_data
+            )
+            
+            # Déformation du modèle
+            vertices_deformed, betas_optimaux = self.deformer_modele_ultra_optimized(
+                v_template, shapedirs, mesures_cibles, mesures_actuelles, J_regressor
+            )
+            
+            # Recalcul des joints après déformation
+            if J_regressor is not None:
+                joints_deformed = J_regressor.dot(vertices_deformed)
+            else:
+                joints_deformed = joints
+            
+            # Détection des points anatomiques
+            points_anatomiques = self.detecter_points_anatomiques_ultra_optimized(vertices_deformed)
+            
+            # Calcul du profil de vêtement
+            profil_params = {
+                'ampleur': clothing_params.ampleur,
+                'evasement': clothing_params.evasement
+            }
+            profil_params = {k: v for k, v in profil_params.items() if v is not None}
+            
+            profil_vetement = self.calculer_profil_jupe_optimized(
+                points_anatomiques, 
+                clothing_params.type,
+                clothing_params.longueur_relative,
+                **profil_params
+            )
+            
+            # Application du vêtement
+            vertices_with_clothing, masque_vetement = self.appliquer_vetement_ultra_optimized(
+                vertices_deformed, profil_vetement
+            )
+            
+            # Calcul des mesures finales
+            mesures_finales = self.calculer_mesures_modele_ultra_optimized(
+                vertices_with_clothing, joints_deformed, self.mapping_cache_data
+            )
+            
+            # Génération de l'ID unique
+            generation_id = str(uuid.uuid4())
+            
+            return {
+                'id': generation_id,
+                'vertices': vertices_with_clothing.astype(np.float32),
+                'faces': f,
+                'couleur_rgb': couleur_rgb,
+                'mesures_finales': mesures_finales,
+                'mesures_cibles': mesures_cibles,
+                'type_vetement': type_vetement,
+                'couleur': couleur,
+                'betas_optimaux': betas_optimaux.tolist(),
+                'metadata': {
+                    'generated_at': datetime.now().isoformat(),
+                    'clothing_params': asdict(clothing_params),
+                    'profil_vetement_summary': {
+                        'y_debut': profil_vetement['y_debut'],
+                        'y_bas': profil_vetement['y_bas'],
+                        'type': profil_vetement['type']
+                    },
+                    'nb_vertices_affected': int(np.sum(masque_vetement)),
+                    'processing_stats': {
+                        'model_file': os.path.basename(npz_path),
+                        'model_vertices': len(vertices_with_clothing),
+                        'model_faces': len(f)
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la génération de vêtement: {str(e)}")
+            raise
+    
+    @timing_decorator
+    def generer_mesh_vedo_optimized(self, vertices: np.ndarray, faces: np.ndarray, 
+                                  couleur_rgb: List[int]) -> Mesh:
+        """Génération de mesh Vedo optimisée"""
+        try:
+            # Normalisation des couleurs
+            couleur_normalized = [c / 255.0 for c in couleur_rgb]
+            
+            # Création du mesh optimisée
+            mesh = Mesh([vertices, faces])
+            mesh.color(couleur_normalized)
+            
+            # Optimisations visuelles
+            mesh.flat()  # Rendu plat pour les vêtements
+            mesh.lighting('off')  # Désactiver l'éclairage pour de meilleures performances
+            
+            return mesh
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la génération du mesh: {str(e)}")
+            raise
+    
+    @timing_decorator
+    def sauvegarder_fichier_optimized(self, vertices: np.ndarray, faces: np.ndarray, 
+                                    filepath: str, format_fichier: str = 'obj') -> bool:
+        """Sauvegarde de fichier optimisée"""
+        try:
+            if format_fichier.lower() == 'obj':
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    # Écriture optimisée avec buffer
+                    vertex_lines = [f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n" for v in vertices]
+                    f.writelines(vertex_lines)
+                    
+                    face_lines = [f"f {face[0]+1} {face[1]+1} {face[2]+1}\n" for face in faces]
+                    f.writelines(face_lines)
+            
+            elif format_fichier.lower() == 'ply':
+                # Sauvegarde PLY optimisée
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write("ply\n")
+                    f.write("format ascii 1.0\n")
+                    f.write(f"element vertex {len(vertices)}\n")
+                    f.write("property float x\n")
+                    f.write("property float y\n")
+                    f.write("property float z\n")
+                    f.write(f"element face {len(faces)}\n")
+                    f.write("property list uchar int vertex_indices\n")
+                    f.write("end_header\n")
+                    
+                    # Écriture des vertices
+                    for vertex in vertices:
+                        f.write(f"{vertex[0]:.6f} {vertex[1]:.6f} {vertex[2]:.6f}\n")
+                    
+                    # Écriture des faces
+                    for face in faces:
+                        f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde: {str(e)}")
+            return False
 
+# Instance globale optimisée
+generator = STARClothingGeneratorOptimized()
 
+# Utilitaires Flask optimisés
+def allowed_file(filename: str) -> bool:
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in config.ALLOWED_EXTENSIONS
 
-# _________________________________________________________API pour la génération de vêtement_____________________________________________________________
-# --- ROUTES API ---
+def secure_filename_custom(filename: str) -> str:
+    """Version optimisée de secure_filename"""
+    filename = secure_filename(filename)
+    timestamp = int(time.time())
+    return f"{timestamp}_{filename}"
 
+def validate_measurements(measurements: Dict[str, Any]) -> Dict[str, float]:
+    """Validation optimisée des mesures"""
+    validated = {}
+    for key, value in measurements.items():
+        try:
+            float_value = float(value)
+            if 0 < float_value < 300:  # Limites raisonnables en cm
+                validated[key] = float_value
+            else:
+                logger.warning(f"Mesure {key} ignorée: valeur {float_value} hors limites")
+        except (ValueError, TypeError):
+            logger.warning(f"Mesure {key} ignorée: conversion impossible")
+    return validated
+
+def create_error_response(message: str, status_code: int = 400) -> tuple:
+    """Création de réponse d'erreur standardisée"""
+    return jsonify({
+        'success': False,
+        'error': message,
+        'timestamp': datetime.now().isoformat()
+    }), status_code
+
+def create_success_response(data: Any, message: str = "Opération réussie") -> dict:
+    """Création de réponse de succès standardisée"""
+    return jsonify({
+        'success': True,
+        'message': message,
+        'data': data,
+        'timestamp': datetime.now().isoformat()
+    })
+
+# Routes de l'API optimisées
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Vérification de l'état de l'API"""
-    return jsonify({
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    
+    return create_success_response({
         'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0'
+        'version': '1.1.0-optimized',
+        'memory_usage_mb': round(memory_info.rss / 1024 / 1024, 2),
+        'cache_stats': {
+            'models_cache_size': len(models_cache.cache),
+            'measurements_cache_size': len(measurements_cache.cache),
+            'clothing_cache_size': len(clothing_cache.cache)
+        },
+        'available_clothing_types': list(TYPES_VETEMENTS.keys()),
+        'available_colors': list(COULEURS_DISPONIBLES.keys())
     })
 
-@app.route('/api/clothing-types', methods=['GET'])
-def get_clothing_types():
-    """Récupère tous les types de vêtements disponibles"""
-    try:
-        types_organises = {
-            "Jupes Droites": [],
-            "Jupes Ovales": [],
-            "Jupes Trapèze": []
+@app.route('/api/types-vetements', methods=['GET'])
+def get_types_vetements():
+    """Récupération des types de vêtements disponibles"""
+    types_details = {}
+    for nom, params in TYPES_VETEMENTS.items():
+        types_details[nom] = {
+            'categorie': params.categorie,
+            'type': params.type,
+            'description': params.description,
+            'longueur_relative': params.longueur_relative
         }
-        
-        for nom_vetement, params in TYPES_VETEMENTS.items():
-            type_vetement = params["type"]
-            if type_vetement == "droite":
-                types_organises["Jupes Droites"].append({
-                    "nom": nom_vetement,
-                    "description": params["description"],
-                    "longueur_relative": params["longueur_relative"]
-                })
-            elif type_vetement == "ovale":
-                types_organises["Jupes Ovales"].append({
-                    "nom": nom_vetement,
-                    "description": params["description"],
-                    "longueur_relative": params["longueur_relative"],
-                    "ampleur": params.get("ampleur", 1.4)
-                })
-            elif type_vetement == "trapeze":
-                types_organises["Jupes Trapèze"].append({
-                    "nom": nom_vetement,
-                    "description": params["description"],
-                    "longueur_relative": params["longueur_relative"],
-                    "evasement": params.get("evasement", 1.6)
-                })
-        
-        return jsonify({
-            'success': True,
-            'data': types_organises,
-            'total_types': len(TYPES_VETEMENTS)
-        })
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération des types: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+    
+    return create_success_response(types_details)
 
-@app.route('/api/colors', methods=['GET'])
-def get_colors():
-    """Récupère toutes les couleurs disponibles"""
-    try:
-        colors_formatted = []
-        for nom, rgb in COULEURS_DISPONIBLES.items():
-            colors_formatted.append({
-                'nom': nom,
-                'rgb': rgb,
-                'hex': f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
-            })
-        
-        return jsonify({
-            'success': True,
-            'data': colors_formatted,
-            'total_colors': len(COULEURS_DISPONIBLES)
-        })
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération des couleurs: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+@app.route('/api/couleurs', methods=['GET'])
+def get_couleurs():
+    """Récupération des couleurs disponibles"""
+    return create_success_response(COULEURS_DISPONIBLES)
 
-@app.route('/api/analyze-body', methods=['POST'])
-def analyze_body():
-    """Analyse un fichier .obj pour détecter les points anatomiques"""
+@app.route('/api/upload-model', methods=['POST'])
+@timing_decorator
+def upload_model():
+    """Upload optimisé de modèle STAR"""
     try:
         if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
+            return create_error_response("Aucun fichier fourni")
         
         file = request.files['file']
         if file.filename == '':
-            return jsonify({'success': False, 'error': 'Aucun fichier sélectionné'}), 400
+            return create_error_response("Nom de fichier vide")
         
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
-            
-            # Charger le mesh
-            mesh_corps = Mesh(filepath)
-            verts = mesh_corps.points
-            
-            # Détecter les points anatomiques
-            points_anat = detecter_points_anatomiques(verts)
-            
-            # Supprimer le fichier temporaire
-            os.remove(filepath)
-            
-            return jsonify({
-                'success': True,
-                'data': {
-                    'points_anatomiques': points_anat,
-                    'nb_points': len(verts),
-                    'dimensions': {
-                        'hauteur': float(points_anat['hauteur_totale']),
-                        'largeur_epaules': float(points_anat['rayon_epaules'] * 2),
-                        'largeur_taille': float(points_anat['rayon_taille'] * 2),
-                        'largeur_hanches': float(points_anat['rayon_hanches'] * 2)
-                    }
-                }
-            })
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
+        if not allowed_file(file.filename):
+            return create_error_response(f"Type de fichier non supporté. Extensions autorisées: {config.ALLOWED_EXTENSIONS}")
+        
+        # Sauvegarde sécurisée
+        filename = secure_filename_custom(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Validation du fichier
+        try:
+            if filename.lower().endswith('.npz'):
+                # Test de chargement
+                test_data = np.load(filepath, allow_pickle=True)
+                required_keys = ['v_template', 'f']
+                missing_keys = [key for key in required_keys if key not in test_data.files]
+                if missing_keys:
+                    os.remove(filepath)
+                    return create_error_response(f"Clés manquantes dans le fichier NPZ: {missing_keys}")
+                test_data.close()
+        except Exception as e:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            return create_error_response(f"Fichier NPZ invalide: {str(e)}")
+        
+        file_info = {
+            'filename': filename,
+            'original_filename': file.filename,
+            'filepath': filepath,
+            'size_mb': round(os.path.getsize(filepath) / 1024 / 1024, 2),
+            'upload_time': datetime.now().isoformat()
+        }
+        
+        return create_success_response(file_info, "Modèle uploadé avec succès")
+        
     except Exception as e:
-        logger.error(f"Erreur lors de l'analyse du corps: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"Erreur lors de l'upload: {str(e)}")
+        return create_error_response(f"Erreur lors de l'upload: {str(e)}")
 
 @app.route('/api/generate-clothing', methods=['POST'])
+@timing_decorator
+@memory_monitor
 def generate_clothing():
-    """Génère un vêtement sur un mannequin"""
+    """Génération optimisée de vêtement"""
     try:
-        # Vérifier la présence du fichier
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
+        # Validation des données d'entrée
+        data = request.get_json()
+        if not data:
+            return create_error_response("Données JSON manquantes")
         
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'success': False, 'error': 'Aucun fichier sélectionné'}), 400
+        required_fields = ['model_file', 'measurements', 'clothing_type', 'color']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return create_error_response(f"Champs manquants: {missing_fields}")
         
-        # Récupérer les paramètres
-        nom_vetement = request.form.get('clothing_type')
-        couleur_nom = request.form.get('color')
+        # Validation du fichier modèle
+        model_filename = data['model_file']
+        model_filepath = os.path.join(app.config['UPLOAD_FOLDER'], model_filename)
+        if not os.path.exists(model_filepath):
+            return create_error_response("Fichier modèle introuvable")
         
-        if not nom_vetement or not couleur_nom:
-            return jsonify({'success': False, 'error': 'Paramètres manquants'}), 400
+        # Validation des mesures
+        measurements = validate_measurements(data['measurements'])
+        if not measurements:
+            return create_error_response("Aucune mesure valide fournie")
         
-        if nom_vetement not in TYPES_VETEMENTS:
-            return jsonify({'success': False, 'error': 'Type de vêtement non reconnu'}), 400
+        # Validation du type de vêtement
+        clothing_type = data['clothing_type']
+        if clothing_type not in TYPES_VETEMENTS:
+            return create_error_response(f"Type de vêtement non supporté: {clothing_type}")
         
-        if couleur_nom not in COULEURS_DISPONIBLES:
-            return jsonify({'success': False, 'error': 'Couleur non reconnue'}), 400
+        # Validation de la couleur
+        color = data['color']
+        if color not in COULEURS_DISPONIBLES:
+            return create_error_response(f"Couleur non disponible: {color}")
         
-        if file and allowed_file(file.filename):
-            # Sauvegarder le fichier temporairement
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
-            
-            # Charger le mesh
-            mesh_corps = Mesh(filepath)
-            
-            # Générer le vêtement
-            mesh_corps_modifie, mesh_vetement = generer_vetement(mesh_corps, nom_vetement, couleur_nom)
-            
-            # Créer un nom de fichier unique
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            nom_fichier = f"{nom_vetement.lower().replace(' ', '_').replace('-', '_')}_{couleur_nom.lower().replace(' ', '_')}_{timestamp}"
-            
-            # Sauvegarder le vêtement
-            chemin_vetement = None
-            if mesh_vetement:
-                chemin_vetement = sauvegarder_vetement(mesh_vetement, app.config['GENERATED_FOLDER'], nom_fichier)
-            
-            # Sauvegarder le corps modifié
-            chemin_corps = os.path.join(app.config['GENERATED_FOLDER'], f"corps_{nom_fichier}.obj")
-            mesh_corps_modifie.write(chemin_corps)
-            
-            # Supprimer le fichier temporaire
-            os.remove(filepath)
-            
-            return jsonify({
-                'success': True,
-                'data': {
-                    'clothing_type': nom_vetement,
-                    'color': couleur_nom,
-                    'files': {
-                        'clothing': chemin_vetement,
-                        'body': chemin_corps
-                    },
-                    'parameters': TYPES_VETEMENTS[nom_vetement],
-                    'color_rgb': COULEURS_DISPONIBLES[couleur_nom]
-                }
-            })
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de la génération du vêtement: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/preview-clothing', methods=['POST'])
-def preview_clothing():
-    """Génère un aperçu du vêtement sans sauvegarder"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
+        # Génération du vêtement
+        with error_handler("Génération de vêtement"):
+            result = generator.generer_vetement_complet_ultra_optimized(
+                model_filepath, measurements, clothing_type, color
+            )
         
-        file = request.files['file']
-        nom_vetement = request.form.get('clothing_type')
-        couleur_nom = request.form.get('color')
+        # Cache du résultat
+        cache_key = f"clothing_{result['id']}"
+        clothing_cache.set(cache_key, result)
         
-        if not nom_vetement or not couleur_nom:
-            return jsonify({'success': False, 'error': 'Paramètres manquants'}), 400
-        
-        if file and allowed_file(file.filename):
-            # Créer un fichier temporaire
-            with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as temp_file:
-                file.save(temp_file.name)
-                
-                # Charger et analyser le mesh
-                mesh_corps = Mesh(temp_file.name)
-                verts = mesh_corps.points
-                
-                # Détecter les points anatomiques
-                points_anat = detecter_points_anatomiques(verts)
-                
-                # Calculer les dimensions du vêtement
-                params_vetement = TYPES_VETEMENTS[nom_vetement]
-                longueur_relative = params_vetement["longueur_relative"]
-                
-                # Calculer les dimensions prévues
-                hauteur_vetement = longueur_relative * points_anat['hauteur_totale']
-                y_bas_prevu = points_anat['y_hanches'] - hauteur_vetement
-                
-                # Supprimer le fichier temporaire
-                os.unlink(temp_file.name)
-                
-                return jsonify({
-                    'success': True,
-                    'data': {
-                        'clothing_type': nom_vetement,
-                        'color': couleur_nom,
-                        'dimensions': {
-                            'hauteur_vetement': float(hauteur_vetement),
-                            'position_debut': float(points_anat['y_taille']),
-                            'position_fin': float(y_bas_prevu),
-                            'rayon_taille': float(points_anat['rayon_taille']),
-                            'rayon_hanches': float(points_anat['rayon_hanches'])
-                        },
-                        'parameters': params_vetement,
-                        'color_rgb': COULEURS_DISPONIBLES[couleur_nom]
-                    }
-                })
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de l'aperçu: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/download/<path:filename>', methods=['GET'])
-def download_file(filename):
-    """Télécharge un fichier généré"""
-    try:
-        # Vérifier que le fichier existe dans le dossier des fichiers générés
-        file_path = os.path.join(app.config['GENERATED_FOLDER'], filename)
-        if os.path.exists(file_path):
-            return send_file(file_path, as_attachment=True)
-        else:
-            return jsonify({'success': False, 'error': 'Fichier non trouvé'}), 404
-    except Exception as e:
-        logger.error(f"Erreur lors du téléchargement: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/list-generated', methods=['GET'])
-def list_generated_files():
-    """Liste tous les fichiers générés"""
-    try:
-        files = []
-        if os.path.exists(app.config['GENERATED_FOLDER']):
-            for filename in os.listdir(app.config['GENERATED_FOLDER']):
-                if filename.endswith('.obj'):
-                    filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
-                    stat = os.stat(filepath)
-                    files.append({
-                        'filename': filename,
-                        'size': stat.st_size,
-                        'created': datetime.fromtimestamp(stat.st_ctime).isoformat(),
-                        'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    })
-        
-        return jsonify({
-            'success': True,
-            'data': files,
-            'total_files': len(files)
-        })
-    except Exception as e:
-        logger.error(f"Erreur lors de la liste des fichiers: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/delete-generated/<filename>', methods=['DELETE'])
-def delete_generated_file(filename):
-    """Supprime un fichier généré"""
-    try:
-        file_path = os.path.join(app.config['GENERATED_FOLDER'], filename)
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return jsonify({'success': True, 'message': 'Fichier supprimé avec succès'})
-        else:
-            return jsonify({'success': False, 'error': 'Fichier non trouvé'}), 404
-    except Exception as e:
-        logger.error(f"Erreur lors de la suppression: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/batch-generate', methods=['POST'])
-def batch_generate():
-    """Génère plusieurs vêtements en lot"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
-        
-        file = request.files['file']
-        batch_config = request.form.get('batch_config')
-        
-        if not batch_config:
-            return jsonify({'success': False, 'error': 'Configuration du lot manquante'}), 400
-        
-        try:
-            batch_config = json.loads(batch_config)
-        except json.JSONDecodeError:
-            return jsonify({'success': False, 'error': 'Configuration du lot invalide'}), 400
-        
-        if file and allowed_file(file.filename):
-            # Sauvegarder le fichier temporairement
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
-            
-            results = []
-            
-            for config in batch_config:
-                try:
-                    nom_vetement = config.get('clothing_type')
-                    couleur_nom = config.get('color')
-                    
-                    if not nom_vetement or not couleur_nom:
-                        results.append({
-                            'config': config,
-                            'success': False,
-                            'error': 'Paramètres manquants'
-                        })
-                        continue
-                    
-                    if nom_vetement not in TYPES_VETEMENTS or couleur_nom not in COULEURS_DISPONIBLES:
-                        results.append({
-                            'config': config,
-                            'success': False,
-                            'error': 'Type de vêtement ou couleur non reconnu'
-                        })
-                        continue
-                    
-                    # Charger le mesh
-                    mesh_corps = Mesh(filepath)
-                    
-                    # Générer le vêtement
-                    mesh_corps_modifie, mesh_vetement = generer_vetement(mesh_corps, nom_vetement, couleur_nom)
-                    
-                    # Créer un nom de fichier unique
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    nom_fichier = f"{nom_vetement.lower().replace(' ', '_').replace('-', '_')}_{couleur_nom.lower().replace(' ', '_')}_{timestamp}"
-                    
-                    # Sauvegarder
-                    chemin_vetement = None
-                    if mesh_vetement:
-                        chemin_vetement = sauvegarder_vetement(mesh_vetement, app.config['GENERATED_FOLDER'], nom_fichier)
-                    
-                    chemin_corps = os.path.join(app.config['GENERATED_FOLDER'], f"corps_{nom_fichier}.obj")
-                    mesh_corps_modifie.write(chemin_corps)
-                    
-                    results.append({
-                        'config': config,
-                        'success': True,
-                        'files': {
-                            'clothing': chemin_vetement,
-                            'body': chemin_corps
-                        }
-                    })
-                    
-                except Exception as e:
-                    results.append({
-                        'config': config,
-                        'success': False,
-                        'error': str(e)
-                    })
-            
-            # Supprimer le fichier temporaire
-            os.remove(filepath)
-            
-            return jsonify({
-                'success': True,
-                'data': results,
-                'total_processed': len(results),
-                'successful': len([r for r in results if r['success']])
-            })
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de la génération en lot: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/validate-mesh', methods=['POST'])
-def validate_mesh():
-    """Valide un fichier mesh avant traitement"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'success': False, 'error': 'Aucun fichier sélectionné'}), 400
-        
-        if file and allowed_file(file.filename):
-            with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as temp_file:
-                file.save(temp_file.name)
-                
-                try:
-                    # Charger le mesh
-                    mesh_corps = Mesh(temp_file.name)
-                    verts = mesh_corps.points
-                    faces = mesh_corps.faces
-                    
-                    # Validations
-                    validations = {
-                        'has_vertices': len(verts) > 0,
-                        'has_faces': len(faces) > 0,
-                        'vertex_count': len(verts),
-                        'face_count': len(faces),
-                        'is_3d': verts.shape[1] == 3 if len(verts) > 0 else False,
-                        'bbox': {
-                            'min': verts.min(axis=0).tolist() if len(verts) > 0 else None,
-                            'max': verts.max(axis=0).tolist() if len(verts) > 0 else None
-                        }
-                    }
-                    
-                    # Vérifications spécifiques pour le corps humain
-                    if len(verts) > 0:
-                        points_anat = detecter_points_anatomiques(verts)
-                        validations['anatomical_points'] = points_anat
-                        validations['height'] = float(points_anat['hauteur_totale'])
-                        validations['is_human_like'] = points_anat['hauteur_totale'] > 1.0  # Hauteur réaliste
-                    
-                    # Supprimer le fichier temporaire
-                    os.unlink(temp_file.name)
-                    
-                    is_valid = (validations['has_vertices'] and 
-                               validations['has_faces'] and 
-                               validations['is_3d'] and 
-                               validations.get('is_human_like', False))
-                    
-                    return jsonify({
-                        'success': True,
-                        'is_valid': is_valid,
-                        'validations': validations
-                    })
-                    
-                except Exception as e:
-                    os.unlink(temp_file.name)
-                    return jsonify({
-                        'success': False,
-                        'is_valid': False,
-                        'error': f'Erreur lors de la validation du mesh: {str(e)}'
-                    })
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de la validation: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/get-mesh-info', methods=['POST'])
-def get_mesh_info():
-    """Obtient des informations détaillées sur un mesh"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'Aucun fichier fourni'}), 400
-        
-        file = request.files['file']
-        if file and allowed_file(file.filename):
-            with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as temp_file:
-                file.save(temp_file.name)
-                
-                try:
-                    mesh_corps = Mesh(temp_file.name)
-                    verts = mesh_corps.points
-                    faces = mesh_corps.faces
-                    
-                    # Informations de base
-                    info = {
-                        'vertex_count': len(verts),
-                        'face_count': len(faces),
-                        'bbox': {
-                            'min': verts.min(axis=0).tolist(),
-                            'max': verts.max(axis=0).tolist(),
-                            'size': (verts.max(axis=0) - verts.min(axis=0)).tolist()
-                        }
-                    }
-                    
-                    # Points anatomiques
-                    points_anat = detecter_points_anatomiques(verts)
-                    info['anatomical_points'] = points_anat
-                    
-                    # Dimensions corporelles
-                    info['body_dimensions'] = {
-                        'height': float(points_anat['hauteur_totale']),
-                        'shoulder_width': float(points_anat['rayon_epaules'] * 2),
-                        'waist_width': float(points_anat['rayon_taille'] * 2),
-                        'hip_width': float(points_anat['rayon_hanches'] * 2)
-                    }
-                    
-                    # Recommandations de vêtements
-                    info['clothing_recommendations'] = []
-                    for nom_vetement, params in TYPES_VETEMENTS.items():
-                        longueur_relative = params['longueur_relative']
-                        longueur_absolue = longueur_relative * points_anat['hauteur_totale']
-                        
-                        info['clothing_recommendations'].append({
-                            'name': nom_vetement,
-                            'description': params['description'],
-                            'estimated_length': float(longueur_absolue),
-                            'parameters': params
-                        })
-                    
-                    # Supprimer le fichier temporaire
-                    os.unlink(temp_file.name)
-                    
-                    return jsonify({
-                        'success': True,
-                        'data': info
-                    })
-                    
-                except Exception as e:
-                    os.unlink(temp_file.name)
-                    return jsonify({'success': False, 'error': str(e)}), 500
-        else:
-            return jsonify({'success': False, 'error': 'Format de fichier non supporté'}), 400
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de l'obtention des informations: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/statistics', methods=['GET'])
-def get_statistics():
-    """Obtient des statistiques sur l'utilisation de l'API"""
-    try:
-        stats = {
-            'total_clothing_types': len(TYPES_VETEMENTS),
-            'total_colors': len(COULEURS_DISPONIBLES),
-            'clothing_types_by_category': {},
-            'generated_files': 0,
-            'total_storage_size': 0
+        # Réponse optimisée (sans les données lourdes)
+        response_data = {
+            'id': result['id'],
+            'type_vetement': result['type_vetement'],
+            'couleur': result['couleur'],
+            'mesures_finales': result['mesures_finales'],
+            'metadata': result['metadata']
         }
         
-        # Statistiques par catégorie
-        for nom_vetement, params in TYPES_VETEMENTS.items():
-            categorie = params['categorie']
-            type_vetement = params['type']
-            
-            if categorie not in stats['clothing_types_by_category']:
-                stats['clothing_types_by_category'][categorie] = {}
-            
-            if type_vetement not in stats['clothing_types_by_category'][categorie]:
-                stats['clothing_types_by_category'][categorie][type_vetement] = 0
-            
-            stats['clothing_types_by_category'][categorie][type_vetement] += 1
-        
-        # Statistiques des fichiers générés
-        if os.path.exists(app.config['GENERATED_FOLDER']):
-            for filename in os.listdir(app.config['GENERATED_FOLDER']):
-                if filename.endswith('.obj'):
-                    stats['generated_files'] += 1
-                    filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
-                    stats['total_storage_size'] += os.path.getsize(filepath)
-        
-        return jsonify({
-            'success': True,
-            'data': stats
-        })
+        return create_success_response(response_data, "Vêtement généré avec succès")
         
     except Exception as e:
-        logger.error(f"Erreur lors de l'obtention des statistiques: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"Erreur lors de la génération: {str(e)}")
+        return create_error_response(f"Erreur lors de la génération: {str(e)}")
+
+@app.route('/api/download-clothing/<clothing_id>', methods=['GET'])
+@timing_decorator
+def download_clothing(clothing_id: str):
+    """Téléchargement optimisé de vêtement"""
+    try:
+        # Format de fichier
+        format_fichier = request.args.get('format', 'obj').lower()
+        if format_fichier not in ['obj', 'ply']:
+            return create_error_response("Format non supporté. Utilisez 'obj' ou 'ply'")
+        
+        # Récupération depuis le cache
+        cache_key = f"clothing_{clothing_id}"
+        clothing_data = clothing_cache.get(cache_key)
+        if not clothing_data:
+            return create_error_response("Vêtement introuvable ou expiré")
+        
+        # Génération du fichier
+        filename = f"vetement_{clothing_id}.{format_fichier}"
+        filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
+        
+        success = generator.sauvegarder_fichier_optimized(
+            clothing_data['vertices'],
+            clothing_data['faces'],
+            filepath,
+            format_fichier
+        )
+        
+        if not success:
+            return create_error_response("Erreur lors de la génération du fichier")
+        
+        # Nettoyage automatique après téléchargement
+        def cleanup():
+            time.sleep(60)  # Attendre 1 minute
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        
+        threading.Thread(target=cleanup, daemon=True).start()
+        
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/octet-stream'
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du téléchargement: {str(e)}")
+        return create_error_response(f"Erreur lors du téléchargement: {str(e)}")
+
+@app.route('/api/clothing-preview/<clothing_id>', methods=['GET'])
+@timing_decorator
+def clothing_preview(clothing_id: str):
+    """Prévisualisation optimisée de vêtement"""
+    try:
+        # Récupération depuis le cache
+        cache_key = f"clothing_{clothing_id}"
+        clothing_data = clothing_cache.get(cache_key)
+        if not clothing_data:
+            return create_error_response("Vêtement introuvable ou expiré")
+        
+        # Génération d'une image de prévisualisation
+        try:
+            mesh = generator.generer_mesh_vedo_optimized(
+                clothing_data['vertices'],
+                clothing_data['faces'],
+                clothing_data['couleur_rgb']
+            )
+            
+            # Configuration de la vue optimisée
+            preview_file = os.path.join(config.TEMP_DIR, f"preview_{clothing_id}.png")
+            
+            # Rendu optimisé sans affichage
+            mesh.show(
+                interactive=False,
+                offscreen=True,
+                size=(800, 600),
+                zoom=1.2,
+                elevation=-30,
+                azimuth=45
+            ).screenshot(preview_file)
+            
+            # Lecture et encodage en base64
+            with open(preview_file, 'rb') as img_file:
+                img_data = base64.b64encode(img_file.read()).decode('utf-8')
+            
+            # Nettoyage
+            os.remove(preview_file)
+            
+            return create_success_response({
+                'preview_image': f"data:image/png;base64,{img_data}",
+                'clothing_info': {
+                    'id': clothing_data['id'],
+                    'type': clothing_data['type_vetement'],
+                    'couleur': clothing_data['couleur']
+                }
+            })
+            
+        except Exception as e:
+            logger.warning(f"Erreur lors de la génération de prévisualisation: {str(e)}")
+            # Retourner les informations sans image
+            return create_success_response({
+                'preview_image': None,
+                'clothing_info': {
+                    'id': clothing_data['id'],
+                    'type': clothing_data['type_vetement'],
+                    'couleur': clothing_data['couleur']
+                },
+                'error': "Prévisualisation non disponible"
+            })
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la prévisualisation: {str(e)}")
+        return create_error_response(f"Erreur lors de la prévisualisation: {str(e)}")
 
 @app.route('/api/clear-cache', methods=['POST'])
 def clear_cache():
-    """Vide le cache et les fichiers temporaires"""
+    """Nettoyage optimisé du cache"""
     try:
-        deleted_files = 0
+        models_cache.clear()
+        measurements_cache.clear()
+        clothing_cache.clear()
         
-        # Nettoyer le dossier des uploads
-        if os.path.exists(app.config['UPLOAD_FOLDER']):
-            for filename in os.listdir(app.config['UPLOAD_FOLDER']):
-                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-                    deleted_files += 1
-        
-        # Optionnel: nettoyer aussi les fichiers générés anciens (plus de 24h)
-        if os.path.exists(app.config['GENERATED_FOLDER']):
-            current_time = datetime.now().timestamp()
-            for filename in os.listdir(app.config['GENERATED_FOLDER']):
-                filepath = os.path.join(app.config['GENERATED_FOLDER'], filename)
-                if os.path.isfile(filepath):
-                    file_time = os.path.getmtime(filepath)
-                    if current_time - file_time > 86400:  # 24 heures
+        # Nettoyage des fichiers temporaires
+        temp_files_deleted = 0
+        for folder in [app.config['GENERATED_FOLDER'], config.TEMP_DIR]:
+            if os.path.exists(folder):
+                for filename in os.listdir(folder):
+                    filepath = os.path.join(folder, filename)
+                    try:
                         os.remove(filepath)
-                        deleted_files += 1
+                        temp_files_deleted += 1
+                    except Exception:
+                        continue
         
-        return jsonify({
-            'success': True,
-            'message': f'{deleted_files} fichiers supprimés du cache'
-        })
-        
-    except Exception as e:
-        logger.error(f"Erreur lors du nettoyage du cache: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-
-
-
-
-# --- Endpoint pour les statistiques ---
-@app.route('/api/stats', methods=['GET'])
-def get_api_stats():
-    """Récupère les statistiques de l'API"""
-    try:
-        stats = {
-            'base_directory': BASE_DIR,
-            'mapping_file': MAPPING_PATH,
-            'temp_directory': TEMP_DIR,
-            'loaded_models': len(models_cache),
-            'available_endpoints': [
-                'GET /api/health',
-                'GET /api/models/available',
-                'POST /api/models/<gender>/load',
-                'GET /api/measurements/mapping',
-                'GET /api/models/<gender>/measurements',
-                'POST /api/models/<gender>/deform',
-                'GET /api/models/<gender>/export/obj',
-                'GET /api/models/<gender>/vertices',
-                'GET /api/models/<gender>/joints',
-                'POST /api/models/cache/clear',
-                'GET /api/models/cache/status',
-                'GET /api/stats'
-            ]
-        }
-        
-        return jsonify({
-            'success': True,
-            'stats': stats,
-            'timestamp': datetime.now().isoformat()
-        })
+        return create_success_response({
+            'caches_cleared': ['models', 'measurements', 'clothing'],
+            'temp_files_deleted': temp_files_deleted
+        }, "Cache nettoyé avec succès")
         
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        logger.error(f"Erreur lors du nettoyage du cache: {str(e)}")
+        return create_error_response(f"Erreur lors du nettoyage: {str(e)}")
 
-# --- Gestion des erreurs ---
+# Gestionnaire d'erreurs global
 @app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'success': False,
-        'error': 'Endpoint non trouvé',
-        'message': 'Vérifiez l\'URL et la méthode HTTP'
-    }), 404
-
+def not_found_error(error):
+    return create_error_response("Endpoint non trouvé", 404)
 
 @app.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        'success': False,
-        'error': 'Méthode HTTP non autorisée',
-        'message': 'Vérifiez la méthode HTTP utilisée'
-    }), 405
+def method_not_allowed_error(error):
+    return create_error_response("Méthode non autorisée", 405)
+
+@app.errorhandler(413)
+def request_entity_too_large_error(error):
+    return create_error_response("Fichier trop volumineux", 413)
 
 @app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'success': False,
-        'error': 'Erreur interne du serveur',
-        'message': 'Une erreur inattendue s\'est produite'
-    }), 500
+def internal_server_error(error):
+    logger.error(f"Erreur serveur interne: {str(error)}")
+    return create_error_response("Erreur serveur interne", 500)
+
+# Nettoyage automatique périodique
+def cleanup_periodic():
+    """Nettoyage périodique des ressources"""
+    while True:
+        try:
+            time.sleep(3600)  # Toutes les heures
+            
+            # Nettoyage des fichiers temporaires anciens
+            cutoff_time = time.time() - 3600  # 1 heure
+            for folder in [app.config['GENERATED_FOLDER'], config.TEMP_DIR]:
+                if os.path.exists(folder):
+                    for filename in os.listdir(folder):
+                        filepath = os.path.join(folder, filename)
+                        if os.path.getmtime(filepath) < cutoff_time:
+                            try:
+                                os.remove(filepath)
+                            except Exception:
+                                continue
+            
+            # Force garbage collection
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"Erreur lors du nettoyage périodique: {str(e)}")
+
+# Démarrage du thread de nettoyage
+cleanup_thread = threading.Thread(target=cleanup_periodic, daemon=True)
+cleanup_thread.start()
 
 if __name__ == '__main__':
-    print("🚀 Démarrage de l'API STAR...")
-    print(f"📁 Répertoire de base: {BASE_DIR}")
-    print(f"📄 Fichier de mapping: {MAPPING_PATH}")
-    print(f"🗂️ Répertoire temporaire: {TEMP_DIR}")
-    print("🌐 API disponible sur: http://localhost:5000")
-    print("📚 Documentation: http://localhost:5000/api/stats")
-    
-    # Créer les dossiers au démarrage
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    os.makedirs(GENERATED_FOLDER, exist_ok=True)
-    
-    logger.info("Démarrage de l'API de génération de vêtements 3D")
+    logger.info("=== Démarrage de l'API STAR Clothing Generator Optimisée ===")
+    logger.info(f"Configuration: {config}")
     logger.info(f"Types de vêtements disponibles: {len(TYPES_VETEMENTS)}")
     logger.info(f"Couleurs disponibles: {len(COULEURS_DISPONIBLES)}")
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Configuration de production optimisée
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False,  # Désactivé pour la production
+        threaded=True,
+        use_reloader=False
+    )
