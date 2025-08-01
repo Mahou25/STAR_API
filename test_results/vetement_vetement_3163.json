@@ -1,0 +1,15 @@
+{
+  "info": {
+    "corrections_appliquees": true,
+    "couleur": "Rouge",
+    "gender": "female",
+    "longueur_vetement": 0.7921161238208331,
+    "mesh_created": true,
+    "nb_points_vetement": 1286,
+    "type": "Jupe ovale au genou",
+    "vertices_count": 6890
+  },
+  "message": "Jupe ovale au genou rouge g\u00e9n\u00e9r\u00e9(e) - VERSION CORRIG\u00c9E",
+  "success": true,
+  "vetement_id": "vetement_3163"
+}

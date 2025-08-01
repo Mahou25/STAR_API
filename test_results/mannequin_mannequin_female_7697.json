@@ -1,0 +1,30 @@
+{
+  "info": {
+    "betas": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "faces_count": 13776,
+    "gender": "female",
+    "has_shapedirs": true,
+    "joints_count": 24,
+    "mesures_appliquees": {
+      "hauteur": 165.0,
+      "tour_hanches": 95.0,
+      "tour_poitrine": 90.0,
+      "tour_taille": 75.0
+    },
+    "vertices_count": 6890
+  },
+  "mannequin_id": "mannequin_female_7697",
+  "message": "Mannequin female g\u00e9n\u00e9r\u00e9",
+  "success": true
+}

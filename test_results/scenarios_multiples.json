@@ -1,0 +1,27 @@
+[
+  {
+    "nom": "Jupe droite noire femme",
+    "success": false,
+    "error": "HTTPConnectionPool(host='127.0.0.1', port=5000): Read timed out. (read timeout=30)"
+  },
+  {
+    "nom": "Mini-jupe ovale bleue",
+    "success": false,
+    "error": "HTTPConnectionPool(host='127.0.0.1', port=5000): Read timed out. (read timeout=30)"
+  },
+  {
+    "nom": "Jupe trapèze bordeaux",
+    "success": false,
+    "error": "HTTPConnectionPool(host='127.0.0.1', port=5000): Read timed out. (read timeout=30)"
+  },
+  {
+    "nom": "Mini-jupe droite blanche",
+    "success": false,
+    "error": "HTTPConnectionPool(host='127.0.0.1', port=5000): Read timed out. (read timeout=30)"
+  },
+  {
+    "nom": "Jupe droite longue verte",
+    "success": false,
+    "error": "HTTPConnectionPool(host='127.0.0.1', port=5000): Read timed out. (read timeout=30)"
+  }
+]

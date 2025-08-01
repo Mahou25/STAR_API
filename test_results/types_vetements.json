@@ -1,0 +1,92 @@
+{
+  "couleurs": {
+    "Blanc Cassé": [
+      230,
+      230,
+      217
+    ],
+    "Bleu Clair": [
+      77,
+      102,
+      204
+    ],
+    "Bleu Marine": [
+      25,
+      25,
+      128
+    ],
+    "Bordeaux": [
+      128,
+      25,
+      51
+    ],
+    "Gris Anthracite": [
+      77,
+      77,
+      77
+    ],
+    "Marron": [
+      102,
+      77,
+      51
+    ],
+    "Noir": [
+      25,
+      25,
+      25
+    ],
+    "Rose Poudré": [
+      204,
+      153,
+      179
+    ],
+    "Rouge": [
+      204,
+      25,
+      25
+    ],
+    "Vert Olive": [
+      102,
+      128,
+      51
+    ]
+  },
+  "types_vetements": {
+    "Jupe droite au genou": {
+      "categorie": "jupe",
+      "description": "Jupe droite classique (genou)",
+      "longueur_relative": 0.35,
+      "type": "droite"
+    },
+    "Jupe droite longue": {
+      "categorie": "jupe",
+      "description": "Jupe droite longue (cheville)",
+      "longueur_relative": 0.75,
+      "type": "droite"
+    },
+    "Jupe ovale au genou": {
+      "categorie": "jupe",
+      "description": "Jupe ovale classique (genou)",
+      "longueur_relative": 0.35,
+      "type": "ovale"
+    },
+    "Jupe trapèze au genou": {
+      "categorie": "jupe",
+      "description": "Jupe trapèze classique (genou)",
+      "longueur_relative": 0.35,
+      "type": "trapeze"
+    },
+    "Mini-jupe droite": {
+      "categorie": "jupe",
+      "description": "Mini-jupe droite (mi-cuisse)",
+      "longueur_relative": 0.15,
+      "type": "droite"
+    },
+    "Mini-jupe ovale": {
+      "categorie": "jupe",
+      "description": "Mini-jupe ovale évasée (mi-cuisse)",
+      "longueur_relative": 0.15,
+      "type": "ovale"
+    }
+  }
+}
